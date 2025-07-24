@@ -1122,6 +1122,19 @@ class LibvirtConnTestCase(test.NoDBTestCase,
     @mock.patch.object(libvirt_driver.LibvirtDriver,
                        '_register_all_undefined_instance_details',
                        new=mock.Mock())
+    @mock.patch.object(fakelibvirt.Connection, 'getVersion',
+                       return_value=versionutils.convert_version_to_int(
+                            (9, 1, 0)))
+    def test_qemu_multifd_with_postcopy_version_ok(self, mock_gv):
+        self.flags(live_migration_parallel_connections=2,
+                   live_migration_permit_post_copy=True,
+                   group='libvirt')
+        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
+        self.assertRaises(exception.InternalError, drvr.init_host, "dummyhost")
+
+    @mock.patch.object(libvirt_driver.LibvirtDriver,
+                       '_register_all_undefined_instance_details',
+                       new=mock.Mock())
     @mock.patch.object(fakelibvirt.Connection, 'getLibVersion',
                        return_value=versionutils.convert_version_to_int(
                             libvirt_driver.NEXT_MIN_LIBVIRT_VERSION))
@@ -1709,6 +1722,21 @@ class LibvirtConnTestCase(test.NoDBTestCase,
                          libvirt_driver.libvirt.VIR_MIGRATE_LIVE |
                          libvirt_driver.libvirt.VIR_MIGRATE_NON_SHARED_INC |
                          libvirt_driver.libvirt.VIR_MIGRATE_AUTO_CONVERGE))
+
+    def test_live_migration_parallel_connections_enabled(self):
+        self.flags(live_migration_parallel_connections=2, group='libvirt')
+        self._do_test_parse_migration_flags(
+            lm_expected=(libvirt_driver.libvirt.VIR_MIGRATE_UNDEFINE_SOURCE |
+                         libvirt_driver.libvirt.VIR_MIGRATE_PERSIST_DEST |
+                         libvirt_driver.libvirt.VIR_MIGRATE_PEER2PEER |
+                         libvirt_driver.libvirt.VIR_MIGRATE_LIVE |
+                         libvirt_driver.libvirt.VIR_MIGRATE_PARALLEL),
+            bm_expected=(libvirt_driver.libvirt.VIR_MIGRATE_UNDEFINE_SOURCE |
+                         libvirt_driver.libvirt.VIR_MIGRATE_PERSIST_DEST |
+                         libvirt_driver.libvirt.VIR_MIGRATE_PEER2PEER |
+                         libvirt_driver.libvirt.VIR_MIGRATE_LIVE |
+                         libvirt_driver.libvirt.VIR_MIGRATE_NON_SHARED_INC |
+                         libvirt_driver.libvirt.VIR_MIGRATE_PARALLEL))
 
     def test_live_migration_permit_auto_converge_and_post_copy_true(self):
         self.flags(live_migration_permit_auto_converge=True, group='libvirt')
@@ -12510,298 +12538,373 @@ class LibvirtConnTestCase(test.NoDBTestCase,
     @mock.patch.object(fakelibvirt.virDomain, "migrateToURI3")
     @mock.patch('nova.virt.libvirt.migration.get_updated_guest_xml',
                 return_value='')
-    @mock.patch('nova.virt.libvirt.guest.Guest.get_xml_desc', return_value='')
-    def test_block_live_migration_native_tls(
-            self, mock_old_xml, mock_new_xml,
-            mock_migrateToURI3, mock_min_version):
-        self.flags(live_migration_with_native_tls=True, group='libvirt')
+        @mock.patch('nova.virt.libvirt.guest.Guest.get_xml_desc', return_value='')
+        def test_block_live_parallel_connections(
+                self, mock_old_xml, mock_new_xml,
+                mock_migrateToURI3, mock_min_version):
+            self.flags(live_migration_parallel_connections=5, group='libvirt')
+            target_connection = None
+            disk_paths = ['vda', 'vdb']
 
-        target_connection = None
-        disk_paths = ['vda', 'vdb']
+            params = {
+                'bandwidth': CONF.libvirt.live_migration_bandwidth,
+                'migrate_disks': disk_paths,
+                'parallel.connections':
+                    CONF.libvirt.live_migration_parallel_connections
+            }
 
-        params = {
-            'bandwidth': CONF.libvirt.live_migration_bandwidth,
-            'migrate_disks': disk_paths
-        }
+            # Start test
+            migrate_data = objects.LibvirtLiveMigrateData(
+                graphics_listen_addr_vnc='0.0.0.0',
+                graphics_listen_addr_spice='0.0.0.0',
+                serial_listen_addr='127.0.0.1',
+                serial_listen_ports=[1234],
+                target_connect_addr=target_connection,
+                bdms=[],
+                block_migration=True)
 
-        # Start test
-        migrate_data = objects.LibvirtLiveMigrateData(
-            graphics_listen_addr_vnc='0.0.0.0',
-            graphics_listen_addr_spice='0.0.0.0',
-            serial_listen_addr='127.0.0.1',
-            serial_listen_ports=[1234],
-            target_connect_addr=target_connection,
-            bdms=[],
-            block_migration=True)
+            dom = fakelibvirt.virDomain
+            guest = libvirt_guest.Guest(dom)
+            drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+            drvr._parse_migration_flags()
+            instance = objects.Instance(**self.test_instance)
+            drvr._live_migration_operation(self.context, instance,
+                                           target_connection, True, migrate_data,
+                                           guest, disk_paths)
 
-        dom = fakelibvirt.virDomain
-        guest = libvirt_guest.Guest(dom)
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
-        drvr._parse_migration_flags()
-        instance = objects.Instance(**self.test_instance)
-        drvr._live_migration_operation(self.context, instance,
-                                       target_connection, True, migrate_data,
-                                       guest, disk_paths)
-
-        expected_flags = (fakelibvirt.VIR_MIGRATE_UNDEFINE_SOURCE |
-                          fakelibvirt.VIR_MIGRATE_PERSIST_DEST |
-                          fakelibvirt.VIR_MIGRATE_PEER2PEER |
-                          fakelibvirt.VIR_MIGRATE_NON_SHARED_INC |
-                          fakelibvirt.VIR_MIGRATE_TLS |
-                          fakelibvirt.VIR_MIGRATE_LIVE)
-        mock_migrateToURI3.assert_called_once_with(
-            drvr._live_migration_uri(target_connection),
-            params=params, flags=expected_flags)
-
-    @mock.patch.object(host.Host, 'has_min_version', return_value=True)
-    @mock.patch.object(fakelibvirt.virDomain, "migrateToURI3")
-    @mock.patch('nova.virt.libvirt.guest.Guest.get_xml_desc',
-                return_value='<xml/>')
-    def test_live_migration_raises_exception(self, mock_xml,
-                                             mock_migrateToURI3,
-                                             mock_min_version):
-        # Prepare data
-        self.compute = manager.ComputeManager()
-        instance_ref = objects.Instance(**self.test_instance)
-        target_connection = '127.0.0.2'
-
-        disk_paths = ['vda', 'vdb']
-        params = {
-            'migrate_uri': 'tcp://127.0.0.2',
-            'migrate_disks': disk_paths,
-            'bandwidth': CONF.libvirt.live_migration_bandwidth,
-            'destination_xml': '<xml/>',
-            'persistent_xml': '<xml/>',
-        }
-
-        # Prepare mocks
-        mock_migrateToURI3.side_effect = fakelibvirt.libvirtError("ERR")
-
-        # Start test
-        migrate_data = objects.LibvirtLiveMigrateData(
-            graphics_listen_addr_vnc='10.0.0.1',
-            graphics_listen_addr_spice='10.0.0.2',
-            serial_listen_addr='127.0.0.1',
-            serial_listen_ports=[1234],
-            target_connect_addr=target_connection,
-            bdms=[],
-            block_migration=False)
-        dom = fakelibvirt.virDomain
-        guest = libvirt_guest.Guest(dom)
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
-        self.assertRaises(fakelibvirt.libvirtError,
-                          drvr._live_migration_operation,
-                          self.context, instance_ref, target_connection,
-                          False, migrate_data, guest, disk_paths)
-        mock_migrateToURI3.assert_called_once_with(
+            expected_flags = (fakelibvirt.VIR_MIGRATE_UNDEFINE_SOURCE |
+                              fakelibvirt.VIR_MIGRATE_PERSIST_DEST |
+                              fakelibvirt.VIR_MIGRATE_PEER2PEER |
+                              fakelibvirt.VIR_MIGRATE_NON_SHARED_INC |
+                              fakelibvirt.VIR_MIGRATE_LIVE |
+                              fakelibvirt.VIR_MIGRATE_PARALLEL)
+            mock_migrateToURI3.assert_called_once_with(
                 drvr._live_migration_uri(target_connection),
-                params=params, flags=0)
+                params=params, flags=expected_flags)
 
-    @mock.patch('shutil.rmtree')
-    @mock.patch('os.path.exists', return_value=True)
-    @mock.patch('nova.virt.libvirt.utils.get_instance_path_at_destination')
-    @mock.patch('nova.virt.libvirt.driver.LibvirtDriver.destroy')
-    def test_rollback_live_migration_at_dest_not_shared(self, mock_destroy,
+        @mock.patch.object(host.Host, 'has_min_version', return_value=True)
+        @mock.patch.object(fakelibvirt.virDomain, "migrateToURI3")
+        @mock.patch('nova.virt.libvirt.migration.get_updated_guest_xml',
+                    return_value='')
+        def test_live_migration_paused_instance_postcopy(self, mock_new_xml,
+                                                         mock_migrateToURI3,
+                                                         mock_min_version):
+            disk_paths = []
+            params = {'bandwidth': CONF.libvirt.live_migration_bandwidth}
+            migrate_data = objects.LibvirtLiveMigrateData(block_migration=False,
+                                                          serial_listen_addr=False)
+            dom = fakelibvirt.virDomain
+            guest = libvirt_guest.Guest(dom)
+            drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+            drvr._parse_migration_flags()
+            instance = objects.Instance(**self.test_instance)
+            instance.vm_state = vm_states.PAUSED
+
+            drvr._live_migration_operation(self.context, instance, 'dest',
+                                           True, migrate_data, guest,
+                                           disk_paths)
+
+            # Verify VIR_MIGRATE_POSTCOPY flag was not set
+            self.assertEqual(drvr._live_migration_flags, 27)
+            mock_migrateToURI3.assert_called_once_with(
+                drvr._live_migration_uri('dest'), params=params, flags=27)
+
+        @mock.patch.object(host.Host, 'has_min_version', return_value=True)
+        @mock.patch.object(fakelibvirt.virDomain, "migrateToURI3")
+        @mock.patch('nova.virt.libvirt.migration.get_updated_guest_xml',
+                    return_value='')
+        @mock.patch('nova.virt.libvirt.guest.Guest.get_xml_desc', return_value='')
+        def test_block_live_migration_native_tls(
+                self, mock_old_xml, mock_new_xml,
+                mock_migrateToURI3, mock_min_version):
+            self.flags(live_migration_with_native_tls=True, group='libvirt')
+
+            target_connection = None
+            disk_paths = ['vda', 'vdb']
+
+            params = {
+                'bandwidth': CONF.libvirt.live_migration_bandwidth,
+                'migrate_disks': disk_paths
+            }
+
+            # Start test
+            migrate_data = objects.LibvirtLiveMigrateData(
+                graphics_listen_addr_vnc='0.0.0.0',
+                graphics_listen_addr_spice='0.0.0.0',
+                serial_listen_addr='127.0.0.1',
+                serial_listen_ports=[1234],
+                target_connect_addr=target_connection,
+                bdms=[],
+                block_migration=True)
+
+            dom = fakelibvirt.virDomain
+            guest = libvirt_guest.Guest(dom)
+            drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+            drvr._parse_migration_flags()
+            instance = objects.Instance(**self.test_instance)
+            drvr._live_migration_operation(self.context, instance,
+                                           target_connection, True, migrate_data,
+                                           guest, disk_paths)
+
+            expected_flags = (fakelibvirt.VIR_MIGRATE_UNDEFINE_SOURCE |
+                              fakelibvirt.VIR_MIGRATE_PERSIST_DEST |
+                              fakelibvirt.VIR_MIGRATE_PEER2PEER |
+                              fakelibvirt.VIR_MIGRATE_NON_SHARED_INC |
+                              fakelibvirt.VIR_MIGRATE_TLS |
+                              fakelibvirt.VIR_MIGRATE_LIVE)
+            mock_migrateToURI3.assert_called_once_with(
+                drvr._live_migration_uri(target_connection),
+                params=params, flags=expected_flags)
+
+        @mock.patch.object(host.Host, 'has_min_version', return_value=True)
+        @mock.patch.object(fakelibvirt.virDomain, "migrateToURI3")
+        @mock.patch('nova.virt.libvirt.guest.Guest.get_xml_desc',
+                    return_value='<xml/>')
+        def test_live_migration_raises_exception(self, mock_xml,
+                                                 mock_migrateToURI3,
+                                                 mock_min_version):
+            # Prepare data
+            self.compute = manager.ComputeManager()
+            instance_ref = objects.Instance(**self.test_instance)
+            target_connection = '127.0.0.2'
+
+            disk_paths = ['vda', 'vdb']
+            params = {
+                'migrate_uri': 'tcp://127.0.0.2',
+                'migrate_disks': disk_paths,
+                'bandwidth': CONF.libvirt.live_migration_bandwidth,
+                'destination_xml': '<xml/>',
+                'persistent_xml': '<xml/>',
+            }
+
+            # Prepare mocks
+            mock_migrateToURI3.side_effect = fakelibvirt.libvirtError("ERR")
+
+            # Start test
+            migrate_data = objects.LibvirtLiveMigrateData(
+                graphics_listen_addr_vnc='10.0.0.1',
+                graphics_listen_addr_spice='10.0.0.2',
+                serial_listen_addr='127.0.0.1',
+                serial_listen_ports=[1234],
+                target_connect_addr=target_connection,
+                bdms=[],
+                block_migration=False)
+            dom = fakelibvirt.virDomain
+            guest = libvirt_guest.Guest(dom)
+            drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+            self.assertRaises(fakelibvirt.libvirtError,
+                              drvr._live_migration_operation,
+                              self.context, instance_ref, target_connection,
+                              False, migrate_data, guest, disk_paths)
+            mock_migrateToURI3.assert_called_once_with(
+                    drvr._live_migration_uri(target_connection),
+                    params=params, flags=0)
+
+        @mock.patch('shutil.rmtree')
+        @mock.patch('os.path.exists', return_value=True)
+        @mock.patch('nova.virt.libvirt.utils.get_instance_path_at_destination')
+        @mock.patch('nova.virt.libvirt.driver.LibvirtDriver.destroy')
+        def test_rollback_live_migration_at_dest_not_shared(self, mock_destroy,
+                                                            mock_get_instance_path,
+                                                            mock_exist,
+                                                            mock_shutil
+                                                            ):
+            # destroy method may raise InstanceTerminationFailure or
+            # InstancePowerOffFailure, here use their base class Invalid.
+            mock_destroy.side_effect = exception.Invalid(reason='just test')
+            fake_instance_path = os.path.join(cfg.CONF.instances_path,
+                                              '/fake_instance_uuid')
+            mock_get_instance_path.return_value = fake_instance_path
+            drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+
+            migrate_data = objects.LibvirtLiveMigrateData(
+                is_shared_instance_path=False,
+                instance_relative_path=False)
+            self.assertRaises(exception.Invalid,
+                              drvr.rollback_live_migration_at_destination,
+                              "context", "instance", [], None, True, migrate_data)
+            mock_exist.assert_called_once_with(fake_instance_path)
+            mock_shutil.assert_called_once_with(fake_instance_path)
+
+        @mock.patch('shutil.rmtree')
+        @mock.patch('os.path.exists')
+        @mock.patch('nova.virt.libvirt.utils.get_instance_path_at_destination')
+        @mock.patch('nova.virt.libvirt.driver.LibvirtDriver.destroy')
+        def test_rollback_live_migration_at_dest_shared(self, mock_destroy,
                                                         mock_get_instance_path,
                                                         mock_exist,
                                                         mock_shutil
                                                         ):
-        # destroy method may raise InstanceTerminationFailure or
-        # InstancePowerOffFailure, here use their base class Invalid.
-        mock_destroy.side_effect = exception.Invalid(reason='just test')
-        fake_instance_path = os.path.join(cfg.CONF.instances_path,
-                                          '/fake_instance_uuid')
-        mock_get_instance_path.return_value = fake_instance_path
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
 
-        migrate_data = objects.LibvirtLiveMigrateData(
-            is_shared_instance_path=False,
-            instance_relative_path=False)
-        self.assertRaises(exception.Invalid,
-                          drvr.rollback_live_migration_at_destination,
-                          "context", "instance", [], None, True, migrate_data)
-        mock_exist.assert_called_once_with(fake_instance_path)
-        mock_shutil.assert_called_once_with(fake_instance_path)
+            def fake_destroy(ctxt, instance, network_info,
+                             block_device_info=None, destroy_disks=True):
+                # This is just here to test the signature. Seems there should
+                # be a better way to do this with mock and autospec.
+                pass
 
-    @mock.patch('shutil.rmtree')
-    @mock.patch('os.path.exists')
-    @mock.patch('nova.virt.libvirt.utils.get_instance_path_at_destination')
-    @mock.patch('nova.virt.libvirt.driver.LibvirtDriver.destroy')
-    def test_rollback_live_migration_at_dest_shared(self, mock_destroy,
-                                                    mock_get_instance_path,
-                                                    mock_exist,
-                                                    mock_shutil
-                                                    ):
+            mock_destroy.side_effect = fake_destroy
+            drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
 
-        def fake_destroy(ctxt, instance, network_info,
-                         block_device_info=None, destroy_disks=True):
-            # This is just here to test the signature. Seems there should
-            # be a better way to do this with mock and autospec.
-            pass
+            migrate_data = objects.LibvirtLiveMigrateData(
+                is_shared_instance_path=True,
+                instance_relative_path=False)
+            drvr.rollback_live_migration_at_destination("context", "instance", [],
+                                                        None, True, migrate_data)
+            mock_destroy.assert_called_once_with("context", "instance", [],
+                                                 None, True)
+            self.assertFalse(mock_get_instance_path.called)
+            self.assertFalse(mock_exist.called)
+            self.assertFalse(mock_shutil.called)
 
-        mock_destroy.side_effect = fake_destroy
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+        @mock.patch.object(fakelibvirt.Domain, "XMLDesc")
+        def test_live_migration_copy_disk_paths_tunnelled(self, mock_xml):
+            self.flags(live_migration_tunnelled=True, group='libvirt')
+            xml = """
+            <domain>
+              <name>dummy</name>
+              <uuid>d4e13113-918e-42fe-9fc9-861693ffd432</uuid>
+              <devices>
+                <disk type="file">
+                   <source file="/var/lib/nova/instance/123/disk.root"/>
+                   <target dev="vda"/>
+                </disk>
+                <disk type="file">
+                   <source file="/var/lib/nova/instance/123/disk.shared"/>
+                   <target dev="vdb"/>
+                   <shareable/>
+                </disk>
+                <disk type="file">
+                   <source file="/var/lib/nova/instance/123/disk.config"/>
+                   <target dev="vdc"/>
+                   <readonly/>
+                </disk>
+                <disk type="block">
+                   <source dev="/dev/mapper/somevol"/>
+                   <target dev="vdd"/>
+                </disk>
+                <disk type="network">
+                   <source protocol="https" name="url_path">
+                     <host name="hostname" port="443"/>
+                   </source>
+                </disk>
+              </devices>
+            </domain>"""
+            mock_xml.return_value = xml
 
-        migrate_data = objects.LibvirtLiveMigrateData(
-            is_shared_instance_path=True,
-            instance_relative_path=False)
-        drvr.rollback_live_migration_at_destination("context", "instance", [],
-                                                    None, True, migrate_data)
-        mock_destroy.assert_called_once_with("context", "instance", [],
-                                             None, True)
-        self.assertFalse(mock_get_instance_path.called)
-        self.assertFalse(mock_exist.called)
-        self.assertFalse(mock_shutil.called)
+            drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+            drvr._parse_migration_flags()
+            dom = fakelibvirt.Domain(drvr._get_connection(), xml, False)
+            guest = libvirt_guest.Guest(dom)
 
-    @mock.patch.object(fakelibvirt.Domain, "XMLDesc")
-    def test_live_migration_copy_disk_paths_tunnelled(self, mock_xml):
-        self.flags(live_migration_tunnelled=True, group='libvirt')
-        xml = """
-        <domain>
-          <name>dummy</name>
-          <uuid>d4e13113-918e-42fe-9fc9-861693ffd432</uuid>
-          <devices>
-            <disk type="file">
-               <source file="/var/lib/nova/instance/123/disk.root"/>
-               <target dev="vda"/>
-            </disk>
-            <disk type="file">
-               <source file="/var/lib/nova/instance/123/disk.shared"/>
-               <target dev="vdb"/>
-               <shareable/>
-            </disk>
-            <disk type="file">
-               <source file="/var/lib/nova/instance/123/disk.config"/>
-               <target dev="vdc"/>
-               <readonly/>
-            </disk>
-            <disk type="block">
-               <source dev="/dev/mapper/somevol"/>
-               <target dev="vdd"/>
-            </disk>
-            <disk type="network">
-               <source protocol="https" name="url_path">
-                 <host name="hostname" port="443"/>
-               </source>
-            </disk>
-          </devices>
-        </domain>"""
-        mock_xml.return_value = xml
+            paths = drvr._live_migration_copy_disk_paths(None, None, guest)
+            self.assertEqual((["/var/lib/nova/instance/123/disk.root",
+                              "/dev/mapper/somevol"], ['vda', 'vdd']), paths)
 
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
-        drvr._parse_migration_flags()
-        dom = fakelibvirt.Domain(drvr._get_connection(), xml, False)
-        guest = libvirt_guest.Guest(dom)
-
-        paths = drvr._live_migration_copy_disk_paths(None, None, guest)
-        self.assertEqual((["/var/lib/nova/instance/123/disk.root",
-                          "/dev/mapper/somevol"], ['vda', 'vdd']), paths)
-
-    @mock.patch.object(host.Host, "get_connection")
-    @mock.patch.object(host.Host, "has_min_version", return_value=True)
-    @mock.patch('nova.virt.driver.get_block_device_info')
-    @mock.patch('nova.objects.BlockDeviceMappingList.get_by_instance_uuid')
-    @mock.patch.object(fakelibvirt.Domain, "XMLDesc")
-    def test_live_migration_copy_disk_paths_selective_block_migration(
-            self, mock_xml, mock_get_instance,
-            mock_block_device_info, mock_version, mock_conn):
-        xml = """
-        <domain>
-          <name>dummy</name>
-          <uuid>d4e13113-918e-42fe-9fc9-861693ffd432</uuid>
-          <devices>
-            <disk type="file">
-               <source file="/var/lib/nova/instance/123/disk.root"/>
-               <target dev="vda"/>
-            </disk>
-            <disk type="file">
-               <source file="/var/lib/nova/instance/123/disk.shared"/>
-               <target dev="vdb"/>
-            </disk>
-            <disk type="file">
-               <source file="/var/lib/nova/instance/123/disk.config"/>
-               <target dev="vdc"/>
-            </disk>
-            <disk type="block">
-               <source dev="/dev/mapper/somevol"/>
-               <target dev="vdd"/>
-            </disk>
-            <disk type="network">
-               <source protocol="https" name="url_path">
-                 <host name="hostname" port="443"/>
-               </source>
-            </disk>
-          </devices>
-        </domain>"""
-        mock_xml.return_value = xml
-        instance = objects.Instance(**self.test_instance)
-        instance.root_device_name = '/dev/vda'
-        block_device_info = {
-            'swap': {
-                'disk_bus': u'virtio',
-                'swap_size': 10,
-                'device_name': u'/dev/vdc'
-            },
-            'root_device_name': u'/dev/vda',
-            'ephemerals': [{
-                'guest_format': u'ext3',
-                'device_name': u'/dev/vdb',
-                'disk_bus': u'virtio',
-                'device_type': u'disk',
-                'size': 1
-            }],
-            'block_device_mapping': [{
-                'guest_format': None,
-                'boot_index': None,
-                'mount_device': u'/dev/vdd',
-                'connection_info': {
-                    u'driver_volume_type': u'iscsi',
-                    'serial': u'147df29f-aec2-4851-b3fe-f68dad151834',
-                    u'data': {
-                        u'access_mode': u'rw',
-                        u'target_discovered': False,
-                        u'encrypted': False,
-                        u'qos_specs': None,
-                        u'target_iqn': u'iqn.2010-10.org.openstack:'
-                                       u'volume-147df29f-aec2-4851-b3fe-'
-                                       u'f68dad151834',
-                        u'target_portal': u'10.102.44.141:3260', u'volume_id':
-                            u'147df29f-aec2-4851-b3fe-f68dad151834',
-                        u'target_lun': 1,
-                        u'auth_password': u'cXELT66FngwzTwpf',
-                        u'auth_username': u'QbQQjj445uWgeQkFKcVw',
-                        u'auth_method': u'CHAP'
-                    }
+        @mock.patch.object(host.Host, "get_connection")
+        @mock.patch.object(host.Host, "has_min_version", return_value=True)
+        @mock.patch('nova.virt.driver.get_block_device_info')
+        @mock.patch('nova.objects.BlockDeviceMappingList.get_by_instance_uuid')
+        @mock.patch.object(fakelibvirt.Domain, "XMLDesc")
+        def test_live_migration_copy_disk_paths_selective_block_migration(
+                self, mock_xml, mock_get_instance,
+                mock_block_device_info, mock_version, mock_conn):
+            xml = """
+            <domain>
+              <name>dummy</name>
+              <uuid>d4e13113-918e-42fe-9fc9-861693ffd432</uuid>
+              <devices>
+                <disk type="file">
+                   <source file="/var/lib/nova/instance/123/disk.root"/>
+                   <target dev="vda"/>
+                </disk>
+                <disk type="file">
+                   <source file="/var/lib/nova/instance/123/disk.shared"/>
+                   <target dev="vdb"/>
+                </disk>
+                <disk type="file">
+                   <source file="/var/lib/nova/instance/123/disk.config"/>
+                   <target dev="vdc"/>
+                </disk>
+                <disk type="block">
+                   <source dev="/dev/mapper/somevol"/>
+                   <target dev="vdd"/>
+                </disk>
+                <disk type="network">
+                   <source protocol="https" name="url_path">
+                     <host name="hostname" port="443"/>
+                   </source>
+                </disk>
+              </devices>
+            </domain>"""
+            mock_xml.return_value = xml
+            instance = objects.Instance(**self.test_instance)
+            instance.root_device_name = '/dev/vda'
+            block_device_info = {
+                'swap': {
+                    'disk_bus': u'virtio',
+                    'swap_size': 10,
+                    'device_name': u'/dev/vdc'
                 },
-                'disk_bus': None,
-                'device_type': None,
-                'delete_on_termination': False
-            }]
-        }
-        mock_block_device_info.return_value = block_device_info
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
-        dom = fakelibvirt.Domain(drvr._get_connection(), xml, False)
-        guest = libvirt_guest.Guest(dom)
-        return_value = drvr._live_migration_copy_disk_paths(self.context,
-                                                            instance,
-                                                            guest)
-        expected = (['/var/lib/nova/instance/123/disk.root',
-                     '/var/lib/nova/instance/123/disk.shared',
-                     '/var/lib/nova/instance/123/disk.config'],
-                    ['vda', 'vdb', 'vdc'])
-        self.assertEqual(expected, return_value)
+                'root_device_name': u'/dev/vda',
+                'ephemerals': [{
+                    'guest_format': u'ext3',
+                    'device_name': u'/dev/vdb',
+                    'disk_bus': u'virtio',
+                    'device_type': u'disk',
+                    'size': 1
+                }],
+                'block_device_mapping': [{
+                    'guest_format': None,
+                    'boot_index': None,
+                    'mount_device': u'/dev/vdd',
+                    'connection_info': {
+                        u'driver_volume_type': u'iscsi',
+                        'serial': u'147df29f-aec2-4851-b3fe-f68dad151834',
+                        u'data': {
+                            u'access_mode': u'rw',
+                            u'target_discovered': False,
+                            u'encrypted': False,
+                            u'qos_specs': None,
+                            u'target_iqn': u'iqn.2010-10.org.openstack:'
+                                           u'volume-147df29f-aec2-4851-b3fe-'
+                                           u'f68dad151834',
+                            u'target_portal': u'10.102.44.141:3260', u'volume_id':
+                                u'147df29f-aec2-4851-b3fe-f68dad151834',
+                            u'target_lun': 1,
+                            u'auth_password': u'cXELT66FngwzTwpf',
+                            u'auth_username': u'QbQQjj445uWgeQkFKcVw',
+                            u'auth_method': u'CHAP'
+                        }
+                    },
+                    'disk_bus': None,
+                    'device_type': None,
+                    'delete_on_termination': False
+                }]
+            }
+            mock_block_device_info.return_value = block_device_info
+            drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+            dom = fakelibvirt.Domain(drvr._get_connection(), xml, False)
+            guest = libvirt_guest.Guest(dom)
+            return_value = drvr._live_migration_copy_disk_paths(self.context,
+                                                                instance,
+                                                                guest)
+            expected = (['/var/lib/nova/instance/123/disk.root',
+                         '/var/lib/nova/instance/123/disk.shared',
+                         '/var/lib/nova/instance/123/disk.config'],
+                        ['vda', 'vdb', 'vdc'])
+            self.assertEqual(expected, return_value)
 
-    @mock.patch.object(libvirt_driver.LibvirtDriver,
-                       "_live_migration_copy_disk_paths")
-    def test_live_migration_data_gb_plain(self, mock_paths):
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
-        instance = objects.Instance(**self.test_instance)
+        @mock.patch.object(libvirt_driver.LibvirtDriver,
+                           "_live_migration_copy_disk_paths")
+        def test_live_migration_data_gb_plain(self, mock_paths):
+            drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+            instance = objects.Instance(**self.test_instance)
 
-        data_gb = drvr._live_migration_data_gb(instance, [])
-        self.assertEqual(2, data_gb)
-        self.assertEqual(0, mock_paths.call_count)
+            data_gb = drvr._live_migration_data_gb(instance, [])
+            self.assertEqual(2, data_gb)
+            self.assertEqual(0, mock_paths.call_count)
 
-    def test_live_migration_data_gb_block(self):
+        def test_live_migration_data_gb_block(self):
         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
         instance = objects.Instance(**self.test_instance)
 
